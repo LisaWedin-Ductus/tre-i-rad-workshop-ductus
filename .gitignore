@@ -1,0 +1,16 @@
+# Hemligheter — får aldrig commitas
+.env
+*.key
+ 
+# Python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.venv/
+ 
+# Editor
+.vscode/
+.idea/
+*.swp
+.DS_Store
