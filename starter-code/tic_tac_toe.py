@@ -1,104 +1,154 @@
 """
-3-i-rad — terminal-version
+3-i-rad — grafisk version (tkinter)
 
-Två spelare turas om att placera X och O på ett 3x3-bräde.
-Spelet avslutas när någon får tre i rad eller brädet är fullt.
+Två spelare turas om att klicka på rutor i ett 3x3-bräde.
+Spelet är helt musdrivet; ingen terminalinmatning krävs under spelet.
 
 Kör med: python tic_tac_toe.py
 """
 
-EMPTY = " "
+import tkinter as tk
+from tkinter import font as tkfont
 
-# De 8 vinstkombinationerna: 3 rader, 3 kolumner, 2 diagonaler
+EMPTY = " "
+PLAYERS = ("X", "O")
+
 WINNING_LINES: list[tuple[int, int, int]] = [
-    (0, 1, 2), (3, 4, 5), (6, 7, 8),  # rader
-    (0, 3, 6), (1, 4, 7), (2, 5, 8),  # kolumner
-    (0, 4, 8), (2, 4, 6),             # diagonaler
+    (0, 1, 2), (3, 4, 5), (6, 7, 8),
+    (0, 3, 6), (1, 4, 7), (2, 5, 8),
+    (0, 4, 8), (2, 4, 6),
 ]
 
-
-def create_board() -> list[str]:
-    """Skapar ett tomt bräde med 9 tomma rutor."""
-    return [EMPTY] * 9
-
-
-def print_board(board: list[str]) -> None:
-    """Skriver ut brädet. Tomma rutor visas som siffran 1-9."""
-    def cell(i: int) -> str:
-        return board[i] if board[i] != EMPTY else str(i + 1)
-
-    print()
-    print(f" {cell(0)} | {cell(1)} | {cell(2)} ")
-    print("---+---+---")
-    print(f" {cell(3)} | {cell(4)} | {cell(5)} ")
-    print("---+---+---")
-    print(f" {cell(6)} | {cell(7)} | {cell(8)} ")
-    print()
+CELL_BG = "#f5f5f5"
+CELL_BG_HOVER = "#eaeaea"
+WIN_BG = "#ffd54a"
+X_COLOR = "#1565c0"
+O_COLOR = "#c62828"
 
 
-def check_winner(board: list[str]) -> str | None:
-    """Returnerar 'X' eller 'O' om någon har vunnit, annars None."""
+def find_winning_line(board: list[str]) -> tuple[int, int, int] | None:
     for a, b, c in WINNING_LINES:
         if board[a] != EMPTY and board[a] == board[b] == board[c]:
-            return board[a]
+            return (a, b, c)
     return None
 
 
-def is_board_full(board: list[str]) -> bool:
-    """Returnerar True om brädet är fullt."""
-    return EMPTY not in board
+class TicTacToeApp:
+    def __init__(self, root: tk.Tk) -> None:
+        self.root = root
+        self.root.title("3-i-rad")
+        self.root.resizable(False, False)
 
+        self.board: list[str] = [EMPTY] * 9
+        self.current_player: str = PLAYERS[0]
+        self.game_over: bool = False
 
-def get_player_move(board: list[str], player: str) -> int:
-    """Frågar spelaren efter ett drag (1-9) och validerar."""
-    while True:
-        raw = input(f"Spelare {player}, välj ruta (1-9): ").strip()
+        self.cell_font = tkfont.Font(family="Helvetica", size=48, weight="bold")
+        self.status_font = tkfont.Font(family="Helvetica", size=16, weight="bold")
+        self.button_font = tkfont.Font(family="Helvetica", size=12)
 
-        if not raw.isdigit():
-            print("  Skriv en siffra mellan 1 och 9.")
-            continue
+        self.status = tk.Label(
+            root,
+            text="",
+            font=self.status_font,
+            pady=12,
+        )
+        self.status.grid(row=0, column=0, columnspan=3, sticky="ew")
 
-        position = int(raw)
-        if not 1 <= position <= 9:
-            print("  Siffran måste vara mellan 1 och 9.")
-            continue
+        self.cells: list[tk.Label] = []
+        for i in range(9):
+            r, c = divmod(i, 3)
+            cell = tk.Label(
+                root,
+                text="",
+                font=self.cell_font,
+                width=2,
+                height=1,
+                bg=CELL_BG,
+                relief="ridge",
+                borderwidth=2,
+                cursor="hand2",
+            )
+            cell.grid(row=1 + r, column=c, padx=4, pady=4, ipadx=8, ipady=8)
+            cell.bind("<Button-1>", lambda _e, idx=i: self.on_cell_click(idx))
+            cell.bind("<Enter>", lambda _e, idx=i: self.on_cell_enter(idx))
+            cell.bind("<Leave>", lambda _e, idx=i: self.on_cell_leave(idx))
+            self.cells.append(cell)
 
-        index = position - 1
+        self.new_game_button = tk.Button(
+            root,
+            text="Nytt spel",
+            font=self.button_font,
+            command=self.reset,
+            cursor="hand2",
+        )
+        self.new_game_button.grid(row=4, column=0, columnspan=3, sticky="ew", padx=4, pady=(8, 12))
 
-        if board[index] != EMPTY:
-            print("  Den rutan är redan tagen, välj en annan.")
-            continue
+        self.reset()
 
-        return index
-
-
-def play_game() -> None:
-    """Huvudloop för ett spel."""
-    board = create_board()
-    current_player = "X"
-
-    print("Välkommen till 3-i-rad!")
-    print("Skriv en siffra 1-9 för att placera ditt märke.")
-
-    while True:
-        print_board(board)
-
-        index = get_player_move(board, current_player)
-        board[index] = current_player
-
-        winner = check_winner(board)
-        if winner is not None:
-            print_board(board)
-            print(f"Spelare {winner} vinner!")
+    def on_cell_click(self, idx: int) -> None:
+        if self.game_over or self.board[idx] != EMPTY:
             return
 
-        if is_board_full(board):
-            print_board(board)
-            print("Oavgjort!")
+        self.board[idx] = self.current_player
+        self.render_cell(idx)
+
+        line = find_winning_line(self.board)
+        if line is not None:
+            self.finish_with_win(self.current_player, line)
             return
 
-        current_player = "O" if current_player == "X" else "X"
+        if EMPTY not in self.board:
+            self.finish_with_draw()
+            return
+
+        self.current_player = PLAYERS[1] if self.current_player == PLAYERS[0] else PLAYERS[0]
+        self.update_status()
+
+    def on_cell_enter(self, idx: int) -> None:
+        if self.game_over or self.board[idx] != EMPTY:
+            return
+        self.cells[idx].configure(bg=CELL_BG_HOVER)
+
+    def on_cell_leave(self, idx: int) -> None:
+        if self.game_over or self.board[idx] != EMPTY:
+            return
+        self.cells[idx].configure(bg=CELL_BG)
+
+    def render_cell(self, idx: int) -> None:
+        mark = self.board[idx]
+        color = X_COLOR if mark == "X" else O_COLOR if mark == "O" else "black"
+        self.cells[idx].configure(text=mark if mark != EMPTY else "", fg=color, bg=CELL_BG)
+
+    def update_status(self) -> None:
+        color = X_COLOR if self.current_player == "X" else O_COLOR
+        self.status.configure(text=f"{self.current_player}s tur", fg=color)
+
+    def finish_with_win(self, winner: str, line: tuple[int, int, int]) -> None:
+        self.game_over = True
+        for idx in line:
+            self.cells[idx].configure(bg=WIN_BG)
+        color = X_COLOR if winner == "X" else O_COLOR
+        self.status.configure(text=f"{winner} vinner!", fg=color)
+
+    def finish_with_draw(self) -> None:
+        self.game_over = True
+        self.status.configure(text="Oavgjort!", fg="black")
+
+    def reset(self) -> None:
+        self.board = [EMPTY] * 9
+        self.current_player = PLAYERS[0]
+        self.game_over = False
+        for i in range(9):
+            self.cells[i].configure(text="", bg=CELL_BG, fg="black")
+        self.update_status()
+
+
+def main() -> None:
+    root = tk.Tk()
+    TicTacToeApp(root)
+    root.mainloop()
 
 
 if __name__ == "__main__":
-    play_game()
+    main()
