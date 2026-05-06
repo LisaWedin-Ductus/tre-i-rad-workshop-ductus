@@ -1,19 +1,24 @@
 """
 3-i-rad — GUI-version med tkinter
+Stödjer 3×3, 7×7 och 10×10
 
 Kör med: python tic_tac_toe.py
 """
 
 import tkinter as tk
 import random
+from typing import Any
 
 EMPTY = " "
 
-WINNING_LINES: list[tuple[int, int, int]] = [
-    (0, 1, 2), (3, 4, 5), (6, 7, 8),
-    (0, 3, 6), (1, 4, 7), (2, 5, 8),
-    (0, 4, 8), (2, 4, 6),
-]
+# size: board side length, win: marks in a row needed to win
+# font_size/cell_w/cell_h: tkinter Label sizing per board
+# ai_depth: minimax search depth (smaller boards can afford deeper search)
+BOARD_CONFIGS: dict[str, dict[str, Any]] = {
+    "3×3":   {"size": 3,  "win": 3, "font_size": 36, "cell_w": 4, "cell_h": 2, "pad": 4, "ai_depth": 9},
+    "7×7":   {"size": 7,  "win": 5, "font_size": 24, "cell_w": 3, "cell_h": 1, "pad": 3, "ai_depth": 3},
+    "10×10": {"size": 10, "win": 5, "font_size": 18, "cell_w": 3, "cell_h": 1, "pad": 2, "ai_depth": 3},
+}
 
 COLOR_BG         = "#F5F5F0"
 COLOR_CELL       = "#FFFFFF"
@@ -22,27 +27,41 @@ COLOR_X          = "#C0392B"
 COLOR_O          = "#2980B9"
 COLOR_WIN        = "#F9E79F"
 COLOR_BUTTON     = "#2C3E50"
-COLOR_SUBTEXT    = "#555555"
 
 DIFFICULTY_EASY   = "Lätt"
 DIFFICULTY_MEDIUM = "Medel"
 DIFFICULTY_HARD   = "Svår"
+
+WIN_SCORE = 10_000_000
 
 
 # ---------------------------------------------------------------------------
 # Pure game logic
 # ---------------------------------------------------------------------------
 
-def check_winner(board: list[str]) -> tuple[str, tuple[int, int, int]] | tuple[None, None]:
-    for line in WINNING_LINES:
-        a, b, c = line
-        if board[a] != EMPTY and board[a] == board[b] == board[c]:
-            return board[a], line
+def generate_winning_lines(size: int, win: int) -> list[tuple[int, ...]]:
+    lines = []
+    for r in range(size):                          # horizontal
+        for c in range(size - win + 1):
+            lines.append(tuple(r * size + c + i for i in range(win)))
+    for c in range(size):                          # vertical
+        for r in range(size - win + 1):
+            lines.append(tuple((r + i) * size + c for i in range(win)))
+    for r in range(size - win + 1):               # diagonal: top-left → bottom-right
+        for c in range(size - win + 1):
+            lines.append(tuple((r + i) * size + (c + i) for i in range(win)))
+    for r in range(size - win + 1):               # diagonal: top-right → bottom-left
+        for c in range(win - 1, size):
+            lines.append(tuple((r + i) * size + (c - i) for i in range(win)))
+    return lines
+
+
+def check_winner(board: list[str], winning_lines: list[tuple]) -> tuple[str, tuple] | tuple[None, None]:
+    for line in winning_lines:
+        mark = board[line[0]]
+        if mark != EMPTY and all(board[i] == mark for i in line):
+            return mark, line
     return None, None
-
-
-def is_board_full(board: list[str]) -> bool:
-    return EMPTY not in board
 
 
 def _empty_cells(board: list[str]) -> list[int]:
@@ -50,56 +69,119 @@ def _empty_cells(board: list[str]) -> list[int]:
 
 
 # ---------------------------------------------------------------------------
-# AI
+# AI helpers
 # ---------------------------------------------------------------------------
 
-def _winning_move(board: list[str], mark: str) -> int | None:
-    """Returns the index that wins immediately for `mark`, or None."""
-    for line in WINNING_LINES:
-        a, b, c = line
-        vals = [board[a], board[b], board[c]]
-        if vals.count(mark) == 2 and vals.count(EMPTY) == 1:
+def _candidate_moves(board: list[str], size: int) -> list[int]:
+    """For boards larger than 3×3, restrict search to cells directly adjacent
+    (radius 1) to any existing mark. Radius 1 is sufficient for win=5 since
+    all relevant extensions are one step from existing marks."""
+    if size == 3:
+        return _empty_cells(board)
+
+    occupied = [i for i, v in enumerate(board) if v != EMPTY]
+    if not occupied:
+        center = size // 2
+        return [center * size + center]
+
+    candidates: set[int] = set()
+    for pos in occupied:
+        r, c = divmod(pos, size)
+        for dr in range(-1, 2):
+            for dc in range(-1, 2):
+                if dr == 0 and dc == 0:
+                    continue
+                nr, nc = r + dr, c + dc
+                if 0 <= nr < size and 0 <= nc < size:
+                    idx = nr * size + nc
+                    if board[idx] == EMPTY:
+                        candidates.add(idx)
+    return list(candidates) or _empty_cells(board)
+
+
+def _winning_move(board: list[str], mark: str, winning_lines: list[tuple], win: int) -> int | None:
+    """Return the index that immediately completes `win - 1` in a row for `mark`."""
+    for line in winning_lines:
+        vals = [board[i] for i in line]
+        if vals.count(mark) == win - 1 and vals.count(EMPTY) == 1:
             return line[vals.index(EMPTY)]
     return None
 
 
-def _minimax(board: list[str], is_maximizing: bool, ai_mark: str, human_mark: str) -> int:
-    winner, _ = check_winner(board)
+def _evaluate(board: list[str], winning_lines: list[tuple], ai_mark: str, human_mark: str) -> int:
+    """Heuristic: score lines by consecutive mark count (5^k per partial line)."""
+    score = 0
+    for line in winning_lines:
+        ai_count    = sum(1 for i in line if board[i] == ai_mark)
+        human_count = sum(1 for i in line if board[i] == human_mark)
+        if human_count == 0 and ai_count > 0:
+            score += 5 ** ai_count
+        elif ai_count == 0 and human_count > 0:
+            score -= 5 ** human_count
+    return score
+
+
+def _minimax(
+    board: list[str], depth: int, is_max: bool, alpha: int, beta: int,
+    ai_mark: str, human_mark: str, winning_lines: list[tuple], size: int,
+) -> int:
+    winner, _ = check_winner(board, winning_lines)
     if winner == ai_mark:
-        return 10
+        return WIN_SCORE + depth
     if winner == human_mark:
-        return -10
-    if is_board_full(board):
-        return 0
+        return -WIN_SCORE - depth
 
-    scores = []
-    for i in _empty_cells(board):
-        board[i] = ai_mark if is_maximizing else human_mark
-        scores.append(_minimax(board, not is_maximizing, ai_mark, human_mark))
-        board[i] = EMPTY
-    return max(scores) if is_maximizing else min(scores)
+    moves = _candidate_moves(board, size)
+    if not moves or depth == 0:
+        return _evaluate(board, winning_lines, ai_mark, human_mark)
+
+    if is_max:
+        best = -WIN_SCORE * 2
+        for i in moves:
+            board[i] = ai_mark
+            best = max(best, _minimax(board, depth - 1, False, alpha, beta, ai_mark, human_mark, winning_lines, size))
+            board[i] = EMPTY
+            alpha = max(alpha, best)
+            if beta <= alpha:
+                break
+        return best
+    else:
+        best = WIN_SCORE * 2
+        for i in moves:
+            board[i] = human_mark
+            best = min(best, _minimax(board, depth - 1, True, alpha, beta, ai_mark, human_mark, winning_lines, size))
+            board[i] = EMPTY
+            beta = min(beta, best)
+            if beta <= alpha:
+                break
+        return best
 
 
-def get_ai_move(board: list[str], difficulty: str, ai_mark: str, human_mark: str) -> int:
+def get_ai_move(
+    board: list[str], difficulty: str, ai_mark: str, human_mark: str,
+    winning_lines: list[tuple], win_length: int, board_size: int, ai_depth: int,
+) -> int:
     available = _empty_cells(board)
 
     if difficulty == DIFFICULTY_EASY:
         return random.choice(available)
 
     if difficulty == DIFFICULTY_MEDIUM:
-        move = _winning_move(board, ai_mark)
+        move = _winning_move(board, ai_mark, winning_lines, win_length)
         if move is not None:
             return move
-        move = _winning_move(board, human_mark)
+        move = _winning_move(board, human_mark, winning_lines, win_length)
         if move is not None:
             return move
         return random.choice(available)
 
-    # Hard: minimax — never loses
-    best_score, best_move = -100, available[0]
-    for i in available:
+    # Hard: alpha-beta minimax with candidate filtering
+    candidates = _candidate_moves(board, board_size)
+    best_score, best_move = -WIN_SCORE * 2, candidates[0]
+    for i in candidates:
         board[i] = ai_mark
-        score = _minimax(board, False, ai_mark, human_mark)
+        score = _minimax(board, ai_depth - 1, False, -WIN_SCORE * 2, WIN_SCORE * 2,
+                         ai_mark, human_mark, winning_lines, board_size)
         board[i] = EMPTY
         if score > best_score:
             best_score, best_move = score, i
@@ -113,52 +195,50 @@ def get_ai_move(board: list[str], difficulty: str, ai_mark: str, human_mark: str
 class TreIRad:
     HUMAN    = "X"
     AI       = "O"
-    AI_DELAY = 500  # ms — short pause so the AI doesn't feel instant
+    AI_DELAY = 500  # ms
 
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title("3-i-rad")
-        self.root.resizable(False, False)
         self.root.configure(bg=COLOR_BG)
 
-        self.board: list[str]   = []
-        self.current_player     = self.HUMAN
-        self.game_over          = False
-        self.game_started       = False
-        self.ai_thinking        = False
-        self._ai_after_id: str | None = None
-        self.cells: list[tk.Label] = []
-        self.diff_buttons: list[tk.Radiobutton] = []
-        self.difficulty = tk.StringVar(value=DIFFICULTY_MEDIUM)
+        # Game state
+        self.board: list[str]       = []
+        self.winning_lines: list    = []
+        self.board_size: int        = 3
+        self.win_length: int        = 3
+        self.ai_depth: int          = 9
+        self.current_player         = self.HUMAN
+        self.game_over              = False
+        self.game_started           = False
+        self.ai_thinking            = False
+        self._ai_after_id           = None
+        self.cells: list[tk.Label]  = []
+        self._selector_buttons: list[tk.Radiobutton] = []
 
-        self._build_ui()
+        self.difficulty   = tk.StringVar(value=DIFFICULTY_MEDIUM)
+        self.board_choice = tk.StringVar(value="3×3")
+
+        self._build_static_ui()
+        self.board_choice.trace_add("write", self._on_board_size_change)
+        self._rebuild_grid()
         self._new_game()
 
     # ------------------------------------------------------------------
     # UI construction (called once)
     # ------------------------------------------------------------------
 
-    def _build_ui(self) -> None:
+    def _build_static_ui(self) -> None:
         self._build_difficulty_bar()
+        self._build_board_size_bar()
 
         self.status_label = tk.Label(
-            self.root, text="", font=("Helvetica", 16), bg=COLOR_BG, pady=8,
+            self.root, text="", font=("Helvetica", 16), bg=COLOR_BG, pady=6,
         )
-        self.status_label.grid(row=1, column=0, columnspan=3, sticky="ew")
+        self.status_label.pack()
 
-        for i in range(9):
-            cell = tk.Label(
-                self.root,
-                text="",
-                font=("Helvetica", 36, "bold"),
-                width=4, height=2,
-                bg=COLOR_CELL, relief="solid", bd=1, cursor="hand2",
-            )
-            cell.grid(row=i // 3 + 2, column=i % 3, padx=4, pady=4)
-            cell.bind("<Button-1>", lambda e, idx=i: self._on_cell_click(idx))
-            cell.bind("<Enter>",    lambda e, idx=i: self._on_hover(idx, True))
-            cell.bind("<Leave>",    lambda e, idx=i: self._on_hover(idx, False))
-            self.cells.append(cell)
+        self._cells_frame = tk.Frame(self.root, bg=COLOR_BG)
+        self._cells_frame.pack(padx=8, pady=4)
 
         tk.Button(
             self.root,
@@ -168,52 +248,93 @@ class TreIRad:
             activebackground="#3D5166", activeforeground="#000000",
             relief="flat", padx=16, pady=8, cursor="hand2",
             command=self._new_game,
-        ).grid(row=5, column=0, columnspan=3, pady=12)
+        ).pack(pady=10)
 
     def _build_difficulty_bar(self) -> None:
-        bar = tk.Frame(self.root, bg=COLOR_BG, pady=8)
-        bar.grid(row=0, column=0, columnspan=3)
-
-        tk.Label(
-            bar, text="Svårighetsgrad:", font=("Helvetica", 11),
-            bg=COLOR_BG, fg="black",
-        ).pack(side="left", padx=(8, 6))
-
+        bar = tk.Frame(self.root, bg=COLOR_BG, pady=6)
+        bar.pack()
+        tk.Label(bar, text="Svårighetsgrad:", font=("Helvetica", 11),
+                 bg=COLOR_BG, fg="black").pack(side="left", padx=(8, 6))
         for level in [DIFFICULTY_EASY, DIFFICULTY_MEDIUM, DIFFICULTY_HARD]:
             btn = tk.Radiobutton(
-                bar,
-                text=level,
-                variable=self.difficulty,
-                value=level,
-                font=("Helvetica", 11),
-                fg="black",
-                bg=COLOR_BG, activebackground=COLOR_BG,
-                selectcolor=COLOR_BG,
+                bar, text=level, variable=self.difficulty, value=level,
+                font=("Helvetica", 11), fg="black",
+                bg=COLOR_BG, activebackground=COLOR_BG, selectcolor=COLOR_BG,
             )
             btn.pack(side="left", padx=4)
-            self.diff_buttons.append(btn)
+            self._selector_buttons.append(btn)
+
+    def _build_board_size_bar(self) -> None:
+        bar = tk.Frame(self.root, bg=COLOR_BG, pady=2)
+        bar.pack()
+        tk.Label(bar, text="Brädstorlek:", font=("Helvetica", 11),
+                 bg=COLOR_BG, fg="black").pack(side="left", padx=(8, 6))
+        for size_key in BOARD_CONFIGS:
+            btn = tk.Radiobutton(
+                bar, text=size_key, variable=self.board_choice, value=size_key,
+                font=("Helvetica", 11), fg="black",
+                bg=COLOR_BG, activebackground=COLOR_BG, selectcolor=COLOR_BG,
+            )
+            btn.pack(side="left", padx=4)
+            self._selector_buttons.append(btn)
+
+    def _rebuild_grid(self) -> None:
+        """Tear down all cell widgets and build a new grid for the current board size."""
+        for widget in self._cells_frame.winfo_children():
+            widget.destroy()
+        self.cells.clear()
+
+        cfg = BOARD_CONFIGS[self.board_choice.get()]
+        self.board_size    = cfg["size"]
+        self.win_length    = cfg["win"]
+        self.ai_depth      = cfg["ai_depth"]
+        self.winning_lines = generate_winning_lines(self.board_size, self.win_length)
+
+        font = ("Helvetica", cfg["font_size"], "bold")
+
+        for i in range(self.board_size ** 2):
+            cell = tk.Label(
+                self._cells_frame,
+                text="",
+                font=font,
+                width=cfg["cell_w"], height=cfg["cell_h"],
+                bg=COLOR_CELL, relief="solid", bd=1, cursor="hand2",
+            )
+            row, col = divmod(i, self.board_size)
+            cell.grid(row=row, column=col, padx=cfg["pad"], pady=cfg["pad"])
+            cell.bind("<Button-1>", lambda _, idx=i: self._on_cell_click(idx))
+            cell.bind("<Enter>",    lambda _, idx=i: self._on_hover(idx, True))
+            cell.bind("<Leave>",    lambda _, idx=i: self._on_hover(idx, False))
+            self.cells.append(cell)
 
     # ------------------------------------------------------------------
     # Game flow
     # ------------------------------------------------------------------
 
-    def _set_difficulty_enabled(self, enabled: bool) -> None:
+    def _set_selectors_enabled(self, enabled: bool) -> None:
         state = "normal" if enabled else "disabled"
-        for btn in self.diff_buttons:
+        for btn in self._selector_buttons:
             btn.config(state=state)
+
+    def _on_board_size_change(self, *_) -> None:
+        if self._ai_after_id is not None:
+            self.root.after_cancel(self._ai_after_id)
+            self._ai_after_id = None
+        self._rebuild_grid()
+        self._new_game()
 
     def _new_game(self) -> None:
         if self._ai_after_id is not None:
             self.root.after_cancel(self._ai_after_id)
             self._ai_after_id = None
 
-        self.board          = [EMPTY] * 9
+        self.board          = [EMPTY] * (self.board_size ** 2)
         self.current_player = self.HUMAN
         self.game_over      = False
         self.game_started   = False
         self.ai_thinking    = False
 
-        self._set_difficulty_enabled(True)
+        self._set_selectors_enabled(True)
         for cell in self.cells:
             cell.config(text="", bg=COLOR_CELL, fg="black", cursor="hand2")
         self._update_status()
@@ -239,7 +360,7 @@ class TreIRad:
 
         if not self.game_started:
             self.game_started = True
-            self._set_difficulty_enabled(False)
+            self._set_selectors_enabled(False)
 
         self._place_mark(index, self.HUMAN)
 
@@ -259,7 +380,10 @@ class TreIRad:
             self.ai_thinking = False
             return
 
-        index = get_ai_move(self.board, self.difficulty.get(), self.AI, self.HUMAN)
+        index = get_ai_move(
+            self.board, self.difficulty.get(), self.AI, self.HUMAN,
+            self.winning_lines, self.win_length, self.board_size, self.ai_depth,
+        )
         self._place_mark(index, self.AI)
         self.ai_thinking = False
 
@@ -276,20 +400,20 @@ class TreIRad:
         color = COLOR_X if player == self.HUMAN else COLOR_O
         self.cells[index].config(text=player, fg=color, cursor="arrow", bg=COLOR_CELL)
 
-        winner, winning_line = check_winner(self.board)
+        winner, winning_line = check_winner(self.board, self.winning_lines)
         if winner is not None:
             for i in winning_line:
                 self.cells[i].config(bg=COLOR_WIN)
             label = "Du vinner! 🎉" if winner == self.HUMAN else "Datorn vinner!"
             self.status_label.config(text=label, fg="black")
             self.game_over = True
-            self._set_difficulty_enabled(True)
+            self._set_selectors_enabled(True)
             return
 
-        if is_board_full(self.board):
+        if EMPTY not in self.board:
             self.status_label.config(text="Oavgjort!", fg="black")
             self.game_over = True
-            self._set_difficulty_enabled(True)
+            self._set_selectors_enabled(True)
 
 
 if __name__ == "__main__":
