@@ -16,7 +16,7 @@ EMPTY = " "
 # ai_depth: minimax search depth (smaller boards can afford deeper search)
 BOARD_CONFIGS: dict[str, dict[str, Any]] = {
     "3×3":   {"size": 3,  "win": 3, "font_size": 36, "cell_w": 4, "cell_h": 2, "pad": 4, "ai_depth": 9},
-    "7×7":   {"size": 7,  "win": 5, "font_size": 24, "cell_w": 3, "cell_h": 1, "pad": 3, "ai_depth": 3},
+    "7×7":   {"size": 7,  "win": 5, "font_size": 24, "cell_w": 3, "cell_h": 1, "pad": 3, "ai_depth": 4},
     "10×10": {"size": 10, "win": 5, "font_size": 18, "cell_w": 3, "cell_h": 1, "pad": 2, "ai_depth": 3},
 }
 
@@ -54,6 +54,16 @@ def generate_winning_lines(size: int, win: int) -> list[tuple[int, ...]]:
         for c in range(win - 1, size):
             lines.append(tuple((r + i) * size + (c - i) for i in range(win)))
     return lines
+
+
+def build_cell_lines(winning_lines: list[tuple], n_cells: int) -> list[list[tuple]]:
+    """For each cell index, the list of winning lines that pass through it.
+    Precomputed once per board config so AI lookups are O(~8) not O(all lines)."""
+    cell_lines: list[list[tuple]] = [[] for _ in range(n_cells)]
+    for line in winning_lines:
+        for idx in line:
+            cell_lines[idx].append(line)
+    return cell_lines
 
 
 def check_winner(board: list[str], winning_lines: list[tuple]) -> tuple[str, tuple] | tuple[None, None]:
@@ -109,21 +119,52 @@ def _winning_move(board: list[str], mark: str, winning_lines: list[tuple], win: 
 
 
 def _evaluate(board: list[str], winning_lines: list[tuple], ai_mark: str, human_mark: str) -> int:
-    """Heuristic: score lines by consecutive mark count (5^k per partial line)."""
+    """Heuristic: score lines by mark count. Uses 10^k so 4-in-a-row (10000)
+    dominates 3-in-a-row (1000) and forces the AI to extend/block threats."""
     score = 0
     for line in winning_lines:
         ai_count    = sum(1 for i in line if board[i] == ai_mark)
         human_count = sum(1 for i in line if board[i] == human_mark)
         if human_count == 0 and ai_count > 0:
-            score += 5 ** ai_count
+            score += 10 ** ai_count
         elif ai_count == 0 and human_count > 0:
-            score -= 5 ** human_count
+            score -= 10 ** human_count
     return score
+
+
+def _move_priority(
+    board: list[str], idx: int, mark: str, opponent: str,
+    cell_lines: list[list[tuple]],
+) -> int:
+    """Score a candidate move for alpha-beta move ordering.
+    Searching high-priority moves first lets alpha-beta prune far more branches."""
+    board[idx] = mark
+    if any(all(board[i] == mark for i in line) for line in cell_lines[idx]):
+        board[idx] = EMPTY
+        return 10_000_000          # immediate win
+    board[idx] = EMPTY
+
+    board[idx] = opponent
+    if any(all(board[i] == opponent for i in line) for line in cell_lines[idx]):
+        board[idx] = EMPTY
+        return 1_000_000           # must block
+    board[idx] = EMPTY
+
+    board[idx] = mark
+    best = 0
+    for line in cell_lines[idx]:
+        if not any(board[i] == opponent for i in line):
+            cnt = sum(1 for i in line if board[i] == mark)
+            if cnt > best:
+                best = cnt
+    board[idx] = EMPTY
+    return 10 ** best
 
 
 def _minimax(
     board: list[str], depth: int, is_max: bool, alpha: int, beta: int,
-    ai_mark: str, human_mark: str, winning_lines: list[tuple], size: int,
+    ai_mark: str, human_mark: str, winning_lines: list[tuple],
+    cell_lines: list[list[tuple]], size: int,
 ) -> int:
     winner, _ = check_winner(board, winning_lines)
     if winner == ai_mark:
@@ -135,11 +176,15 @@ def _minimax(
     if not moves or depth == 0:
         return _evaluate(board, winning_lines, ai_mark, human_mark)
 
+    mark     = ai_mark if is_max else human_mark
+    opponent = human_mark if is_max else ai_mark
+    moves = sorted(moves, key=lambda i: _move_priority(board, i, mark, opponent, cell_lines), reverse=True)
+
     if is_max:
         best = -WIN_SCORE * 2
         for i in moves:
             board[i] = ai_mark
-            best = max(best, _minimax(board, depth - 1, False, alpha, beta, ai_mark, human_mark, winning_lines, size))
+            best = max(best, _minimax(board, depth - 1, False, alpha, beta, ai_mark, human_mark, winning_lines, cell_lines, size))
             board[i] = EMPTY
             alpha = max(alpha, best)
             if beta <= alpha:
@@ -149,7 +194,7 @@ def _minimax(
         best = WIN_SCORE * 2
         for i in moves:
             board[i] = human_mark
-            best = min(best, _minimax(board, depth - 1, True, alpha, beta, ai_mark, human_mark, winning_lines, size))
+            best = min(best, _minimax(board, depth - 1, True, alpha, beta, ai_mark, human_mark, winning_lines, cell_lines, size))
             board[i] = EMPTY
             beta = min(beta, best)
             if beta <= alpha:
@@ -159,7 +204,8 @@ def _minimax(
 
 def get_ai_move(
     board: list[str], difficulty: str, ai_mark: str, human_mark: str,
-    winning_lines: list[tuple], win_length: int, board_size: int, ai_depth: int,
+    winning_lines: list[tuple], cell_lines: list[list[tuple]],
+    win_length: int, board_size: int, ai_depth: int,
 ) -> int:
     available = _empty_cells(board)
 
@@ -175,16 +221,21 @@ def get_ai_move(
             return move
         return random.choice(available)
 
-    # Hard: alpha-beta minimax with candidate filtering
+    # Hard: alpha-beta minimax with move ordering
     candidates = _candidate_moves(board, board_size)
+    candidates = sorted(candidates, key=lambda i: _move_priority(board, i, ai_mark, human_mark, cell_lines), reverse=True)
     best_score, best_move = -WIN_SCORE * 2, candidates[0]
+    alpha = -WIN_SCORE * 2
     for i in candidates:
         board[i] = ai_mark
-        score = _minimax(board, ai_depth - 1, False, -WIN_SCORE * 2, WIN_SCORE * 2,
-                         ai_mark, human_mark, winning_lines, board_size)
+        score = _minimax(board, ai_depth - 1, False, alpha, WIN_SCORE * 2,
+                         ai_mark, human_mark, winning_lines, cell_lines, board_size)
         board[i] = EMPTY
         if score > best_score:
             best_score, best_move = score, i
+            alpha = best_score
+        if best_score >= WIN_SCORE:
+            break  # guaranteed win found — no need to search further
     return best_move
 
 
@@ -203,11 +254,12 @@ class TreIRad:
         self.root.configure(bg=COLOR_BG)
 
         # Game state
-        self.board: list[str]       = []
-        self.winning_lines: list    = []
-        self.board_size: int        = 3
-        self.win_length: int        = 3
-        self.ai_depth: int          = 9
+        self.board: list[str]           = []
+        self.winning_lines: list        = []
+        self.cell_lines: list           = []
+        self.board_size: int            = 3
+        self.win_length: int            = 3
+        self.ai_depth: int              = 9
         self.current_player         = self.HUMAN
         self.game_over              = False
         self.game_started           = False
@@ -289,6 +341,7 @@ class TreIRad:
         self.win_length    = cfg["win"]
         self.ai_depth      = cfg["ai_depth"]
         self.winning_lines = generate_winning_lines(self.board_size, self.win_length)
+        self.cell_lines    = build_cell_lines(self.winning_lines, self.board_size ** 2)
 
         font = ("Helvetica", cfg["font_size"], "bold")
 
@@ -382,7 +435,7 @@ class TreIRad:
 
         index = get_ai_move(
             self.board, self.difficulty.get(), self.AI, self.HUMAN,
-            self.winning_lines, self.win_length, self.board_size, self.ai_depth,
+            self.winning_lines, self.cell_lines, self.win_length, self.board_size, self.ai_depth,
         )
         self._place_mark(index, self.AI)
         self.ai_thinking = False
