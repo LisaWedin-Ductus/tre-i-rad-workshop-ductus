@@ -1,19 +1,20 @@
 """
 3-i-rad — GUI-version med tkinter
-Stödjer 3×3, 7×7 och 10×10
+Stödjer 3×3, 7×7 och 10×10, med valfri AI-kommentator via Claude API.
 
 Kör med: python tic_tac_toe.py
 """
 
-import tkinter as tk
+import os
 import random
+import threading
+import tkinter as tk
 from typing import Any
+
+import anthropic
 
 EMPTY = " "
 
-# size: board side length, win: marks in a row needed to win
-# font_size/cell_w/cell_h: tkinter Label sizing per board
-# ai_depth: minimax search depth (smaller boards can afford deeper search)
 BOARD_CONFIGS: dict[str, dict[str, Any]] = {
     "3×3":   {"size": 3,  "win": 3, "font_size": 36, "cell_w": 4, "cell_h": 2, "pad": 4, "ai_depth": 9},
     "7×7":   {"size": 7,  "win": 5, "font_size": 24, "cell_w": 3, "cell_h": 1, "pad": 3, "ai_depth": 4},
@@ -32,7 +33,50 @@ DIFFICULTY_EASY   = "Lätt"
 DIFFICULTY_MEDIUM = "Medel"
 DIFFICULTY_HARD   = "Svår"
 
+COMMENTATOR_NONE = "Inga kommentarer"
+COMMENTATOR_MODEL = "claude-haiku-4-5-20251001"
+
+CHARACTER_PROMPTS: dict[str, str] = {
+    "Donald Trump": (
+        "You are Donald Trump commentating a tic-tac-toe game. "
+        "Speak EXACTLY like Trump: use 'tremendous', 'bigly', 'believe me', "
+        "'many people are saying', 'nobody knows tic-tac-toe better than me'. "
+        "Make it about yourself and winning. Keep it to 1-2 sentences. Do not break character."
+    ),
+    "Hulk Hogan": (
+        "You are Hulk Hogan commentating a tic-tac-toe game. "
+        "Speak like Hulk Hogan: say 'brother', 'whatcha gonna do', use wrestling metaphors, "
+        "reference Hulkamania, training, vitamins and prayers. "
+        "Keep it to 1-2 sentences. Do not break character."
+    ),
+    "Dolly Parton": (
+        "You are Dolly Parton commentating a tic-tac-toe game. "
+        "Speak with Southern charm and wit: use country expressions, be warm and funny, "
+        "occasionally reference country music, rhinestones or your Tennessee roots. "
+        "Keep it to 1-2 sentences. Do not break character."
+    ),
+}
+
 WIN_SCORE = 10_000_000
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _load_api_key() -> str:
+    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    try:
+        with open(env_path) as f:
+            for line in f:
+                line = line.strip()
+                if "=" in line and not line.startswith("#"):
+                    key, _, val = line.partition("=")
+                    if key.strip() == "ANTHROPIC_API_KEY":
+                        return val.strip().strip('"').strip("'")
+    except FileNotFoundError:
+        pass
+    return os.environ.get("ANTHROPIC_API_KEY", "")
 
 
 # ---------------------------------------------------------------------------
@@ -41,24 +85,22 @@ WIN_SCORE = 10_000_000
 
 def generate_winning_lines(size: int, win: int) -> list[tuple[int, ...]]:
     lines = []
-    for r in range(size):                          # horizontal
+    for r in range(size):
         for c in range(size - win + 1):
             lines.append(tuple(r * size + c + i for i in range(win)))
-    for c in range(size):                          # vertical
+    for c in range(size):
         for r in range(size - win + 1):
             lines.append(tuple((r + i) * size + c for i in range(win)))
-    for r in range(size - win + 1):               # diagonal: top-left → bottom-right
+    for r in range(size - win + 1):
         for c in range(size - win + 1):
             lines.append(tuple((r + i) * size + (c + i) for i in range(win)))
-    for r in range(size - win + 1):               # diagonal: top-right → bottom-left
+    for r in range(size - win + 1):
         for c in range(win - 1, size):
             lines.append(tuple((r + i) * size + (c - i) for i in range(win)))
     return lines
 
 
 def build_cell_lines(winning_lines: list[tuple], n_cells: int) -> list[list[tuple]]:
-    """For each cell index, the list of winning lines that pass through it.
-    Precomputed once per board config so AI lookups are O(~8) not O(all lines)."""
     cell_lines: list[list[tuple]] = [[] for _ in range(n_cells)]
     for line in winning_lines:
         for idx in line:
@@ -79,21 +121,16 @@ def _empty_cells(board: list[str]) -> list[int]:
 
 
 # ---------------------------------------------------------------------------
-# AI helpers
+# AI
 # ---------------------------------------------------------------------------
 
 def _candidate_moves(board: list[str], size: int) -> list[int]:
-    """For boards larger than 3×3, restrict search to cells directly adjacent
-    (radius 1) to any existing mark. Radius 1 is sufficient for win=5 since
-    all relevant extensions are one step from existing marks."""
     if size == 3:
         return _empty_cells(board)
-
     occupied = [i for i, v in enumerate(board) if v != EMPTY]
     if not occupied:
         center = size // 2
         return [center * size + center]
-
     candidates: set[int] = set()
     for pos in occupied:
         r, c = divmod(pos, size)
@@ -110,7 +147,6 @@ def _candidate_moves(board: list[str], size: int) -> list[int]:
 
 
 def _winning_move(board: list[str], mark: str, winning_lines: list[tuple], win: int) -> int | None:
-    """Return the index that immediately completes `win - 1` in a row for `mark`."""
     for line in winning_lines:
         vals = [board[i] for i in line]
         if vals.count(mark) == win - 1 and vals.count(EMPTY) == 1:
@@ -119,8 +155,6 @@ def _winning_move(board: list[str], mark: str, winning_lines: list[tuple], win: 
 
 
 def _evaluate(board: list[str], winning_lines: list[tuple], ai_mark: str, human_mark: str) -> int:
-    """Heuristic: score lines by mark count. Uses 10^k so 4-in-a-row (10000)
-    dominates 3-in-a-row (1000) and forces the AI to extend/block threats."""
     score = 0
     for line in winning_lines:
         ai_count    = sum(1 for i in line if board[i] == ai_mark)
@@ -136,18 +170,16 @@ def _move_priority(
     board: list[str], idx: int, mark: str, opponent: str,
     cell_lines: list[list[tuple]],
 ) -> int:
-    """Score a candidate move for alpha-beta move ordering.
-    Searching high-priority moves first lets alpha-beta prune far more branches."""
     board[idx] = mark
     if any(all(board[i] == mark for i in line) for line in cell_lines[idx]):
         board[idx] = EMPTY
-        return 10_000_000          # immediate win
+        return 10_000_000
     board[idx] = EMPTY
 
     board[idx] = opponent
     if any(all(board[i] == opponent for i in line) for line in cell_lines[idx]):
         board[idx] = EMPTY
-        return 1_000_000           # must block
+        return 1_000_000
     board[idx] = EMPTY
 
     board[idx] = mark
@@ -221,7 +253,6 @@ def get_ai_move(
             return move
         return random.choice(available)
 
-    # Hard: alpha-beta minimax with move ordering
     candidates = _candidate_moves(board, board_size)
     candidates = sorted(candidates, key=lambda i: _move_priority(board, i, ai_mark, human_mark, cell_lines), reverse=True)
     best_score, best_move = -WIN_SCORE * 2, candidates[0]
@@ -235,7 +266,7 @@ def get_ai_move(
             best_score, best_move = score, i
             alpha = best_score
         if best_score >= WIN_SCORE:
-            break  # guaranteed win found — no need to search further
+            break
     return best_move
 
 
@@ -246,30 +277,36 @@ def get_ai_move(
 class TreIRad:
     HUMAN    = "X"
     AI       = "O"
-    AI_DELAY = 500  # ms
+    AI_DELAY = 500
 
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title("3-i-rad")
         self.root.configure(bg=COLOR_BG)
 
+        self._api_key = _load_api_key()
+
         # Game state
-        self.board: list[str]           = []
-        self.winning_lines: list        = []
-        self.cell_lines: list           = []
-        self.board_size: int            = 3
-        self.win_length: int            = 3
-        self.ai_depth: int              = 9
+        self.board: list[str]       = []
+        self.winning_lines: list    = []
+        self.cell_lines: list       = []
+        self.board_size: int        = 3
+        self.win_length: int        = 3
+        self.ai_depth: int          = 9
         self.current_player         = self.HUMAN
         self.game_over              = False
         self.game_started           = False
         self.ai_thinking            = False
+        self.commentary_pending     = False
+        self._pending_ai_move       = False
+        self._session_id            = 0
         self._ai_after_id           = None
         self.cells: list[tk.Label]  = []
         self._selector_buttons: list[tk.Radiobutton] = []
 
         self.difficulty   = tk.StringVar(value=DIFFICULTY_MEDIUM)
         self.board_choice = tk.StringVar(value="3×3")
+        self.commentator  = tk.StringVar(value=COMMENTATOR_NONE)
 
         self._build_static_ui()
         self.board_choice.trace_add("write", self._on_board_size_change)
@@ -283,6 +320,7 @@ class TreIRad:
     def _build_static_ui(self) -> None:
         self._build_difficulty_bar()
         self._build_board_size_bar()
+        self._build_commentator_bar()
 
         self.status_label = tk.Label(
             self.root, text="", font=("Helvetica", 16), bg=COLOR_BG, pady=6,
@@ -301,6 +339,8 @@ class TreIRad:
             relief="flat", padx=16, pady=8, cursor="hand2",
             command=self._new_game,
         ).pack(pady=10)
+
+        self._build_chat_window()
 
     def _build_difficulty_bar(self) -> None:
         bar = tk.Frame(self.root, bg=COLOR_BG, pady=6)
@@ -330,8 +370,49 @@ class TreIRad:
             btn.pack(side="left", padx=4)
             self._selector_buttons.append(btn)
 
+    def _build_commentator_bar(self) -> None:
+        bar = tk.Frame(self.root, bg=COLOR_BG, pady=2)
+        bar.pack()
+        tk.Label(bar, text="Kommentator:", font=("Helvetica", 11),
+                 bg=COLOR_BG, fg="black").pack(side="left", padx=(8, 6))
+        for name in [COMMENTATOR_NONE, "Donald Trump", "Hulk Hogan", "Dolly Parton"]:
+            tk.Radiobutton(
+                bar, text=name, variable=self.commentator, value=name,
+                font=("Helvetica", 11), fg="black",
+                bg=COLOR_BG, activebackground=COLOR_BG, selectcolor=COLOR_BG,
+            ).pack(side="left", padx=4)
+
+    def _build_chat_window(self) -> None:
+        outer = tk.Frame(self.root, bg=COLOR_BG)
+        outer.pack(fill="x", padx=12, pady=(0, 10))
+
+        tk.Label(outer, text="Kommentatorsbåset", font=("Helvetica", 10),
+                 bg=COLOR_BG, fg="black").pack(anchor="w")
+
+        inner = tk.Frame(outer, bg=COLOR_BG)
+        inner.pack(fill="x")
+
+        scrollbar = tk.Scrollbar(inner)
+        scrollbar.pack(side="right", fill="y")
+
+        self.chat_box = tk.Text(
+            inner,
+            height=5,
+            wrap="word",
+            state="disabled",
+            yscrollcommand=scrollbar.set,
+            bg="#FFFFFF",
+            fg="black",
+            font=("Helvetica", 11),
+            relief="solid",
+            bd=1,
+        )
+        self.chat_box.pack(side="left", fill="x", expand=True)
+        scrollbar.config(command=self.chat_box.yview)
+
+        self.chat_box.tag_config("name", font=("Helvetica", 11, "bold"))
+
     def _rebuild_grid(self) -> None:
-        """Tear down all cell widgets and build a new grid for the current board size."""
         for widget in self._cells_frame.winfo_children():
             widget.destroy()
         self.cells.clear()
@@ -344,7 +425,6 @@ class TreIRad:
         self.cell_lines    = build_cell_lines(self.winning_lines, self.board_size ** 2)
 
         font = ("Helvetica", cfg["font_size"], "bold")
-
         for i in range(self.board_size ** 2):
             cell = tk.Label(
                 self._cells_frame,
@@ -381,11 +461,14 @@ class TreIRad:
             self.root.after_cancel(self._ai_after_id)
             self._ai_after_id = None
 
-        self.board          = [EMPTY] * (self.board_size ** 2)
-        self.current_player = self.HUMAN
-        self.game_over      = False
-        self.game_started   = False
-        self.ai_thinking    = False
+        self._session_id       += 1
+        self.board              = [EMPTY] * (self.board_size ** 2)
+        self.current_player     = self.HUMAN
+        self.game_over          = False
+        self.game_started       = False
+        self.ai_thinking        = False
+        self.commentary_pending = False
+        self._pending_ai_move   = False
 
         self._set_selectors_enabled(True)
         for cell in self.cells:
@@ -393,7 +476,9 @@ class TreIRad:
         self._update_status()
 
     def _update_status(self) -> None:
-        if self.current_player == self.HUMAN:
+        if self.commentary_pending:
+            self.status_label.config(text="Kommenterar...", fg="black")
+        elif self.current_player == self.HUMAN:
             self.status_label.config(text="Din tur (X)", fg="black")
         else:
             self.status_label.config(text="Datorns tur (O)…", fg="black")
@@ -403,21 +488,24 @@ class TreIRad:
     # ------------------------------------------------------------------
 
     def _on_hover(self, index: int, entering: bool) -> None:
-        if self.game_over or self.ai_thinking or self.board[index] != EMPTY:
+        if self.game_over or self.ai_thinking or self.commentary_pending or self.board[index] != EMPTY:
             return
         self.cells[index].config(bg=COLOR_CELL_HOVER if entering else COLOR_CELL)
 
     def _on_cell_click(self, index: int) -> None:
-        if self.game_over or self.ai_thinking or self.board[index] != EMPTY:
+        if self.game_over or self.ai_thinking or self.commentary_pending or self.board[index] != EMPTY:
             return
 
         if not self.game_started:
             self.game_started = True
             self._set_selectors_enabled(False)
 
-        self._place_mark(index, self.HUMAN)
+        event = self._place_mark(index, self.HUMAN)
 
-        if not self.game_over:
+        if self.commentator.get() != COMMENTATOR_NONE:
+            self._pending_ai_move = not self.game_over
+            self._request_commentary(self.HUMAN, index, event)
+        elif not self.game_over:
             self.current_player = self.AI
             self.ai_thinking    = True
             self._update_status()
@@ -437,18 +525,29 @@ class TreIRad:
             self.board, self.difficulty.get(), self.AI, self.HUMAN,
             self.winning_lines, self.cell_lines, self.win_length, self.board_size, self.ai_depth,
         )
-        self._place_mark(index, self.AI)
         self.ai_thinking = False
+        event = self._place_mark(index, self.AI)
 
-        if not self.game_over:
+        if self.commentator.get() != COMMENTATOR_NONE:
+            self._pending_ai_move = False
+            self._request_commentary(self.AI, index, event)
+        elif not self.game_over:
             self.current_player = self.HUMAN
             self._update_status()
 
     # ------------------------------------------------------------------
-    # Shared move logic
+    # Move logic — returns the event type for commentary
     # ------------------------------------------------------------------
 
-    def _place_mark(self, index: int, player: str) -> None:
+    def _place_mark(self, index: int, player: str) -> str:
+        opponent = self.HUMAN if player == self.AI else self.AI
+
+        # Detect missed-win and block BEFORE changing the board
+        winning_opp  = _winning_move(self.board, player, self.winning_lines, self.win_length)
+        missed_win   = winning_opp is not None and winning_opp != index
+        opp_near_win = _winning_move(self.board, opponent, self.winning_lines, self.win_length)
+        blocks       = opp_near_win == index
+
         self.board[index] = player
         color = COLOR_X if player == self.HUMAN else COLOR_O
         self.cells[index].config(text=player, fg=color, cursor="arrow", bg=COLOR_CELL)
@@ -461,12 +560,109 @@ class TreIRad:
             self.status_label.config(text=label, fg="black")
             self.game_over = True
             self._set_selectors_enabled(True)
-            return
+            return "win"
 
         if EMPTY not in self.board:
             self.status_label.config(text="Oavgjort!", fg="black")
             self.game_over = True
             self._set_selectors_enabled(True)
+            return "draw"
+
+        if missed_win:
+            return "missed_win"
+
+        if _winning_move(self.board, player, self.winning_lines, self.win_length) is not None:
+            return "created_threat"
+
+        if blocks:
+            return "blocked_threat"
+
+        return "normal"
+
+    # ------------------------------------------------------------------
+    # Commentary
+    # ------------------------------------------------------------------
+
+    def _build_commentary_prompt(self, player: str, index: int, event: str) -> str:
+        is_human    = player == self.HUMAN
+        player_desc = "The human player (X)" if is_human else "The computer AI (O)"
+        move_num    = self.board_size ** 2 - self.board.count(EMPTY)
+
+        context = (
+            f"Game: {self.board_size}×{self.board_size} tic-tac-toe, "
+            f"{self.win_length} in a row to win. Move #{move_num}. "
+        )
+        descriptions = {
+            "win":            f"{player_desc} just WON the game by getting {self.win_length} in a row!",
+            "draw":           "The game ended in a DRAW — the board is full and nobody won!",
+            "missed_win":     f"{player_desc} had a GUARANTEED winning move but played elsewhere — what a blunder!",
+            "created_threat": f"{player_desc} just created a dangerous threat with {self.win_length - 1} in a row!",
+            "blocked_threat": f"{player_desc} just blocked the opponent's winning threat just in time!",
+            "normal":         f"{player_desc} made a move. The game continues.",
+        }
+        return context + descriptions.get(event, descriptions["normal"])
+
+    def _request_commentary(self, player: str, index: int, event: str) -> None:
+        character = self.commentator.get()
+        if character == COMMENTATOR_NONE:
+            return
+
+        self.commentary_pending = True
+        self._update_status()
+
+        if not self._api_key:
+            self.root.after(0, self._display_commentary,
+                            character, "[API-nyckel saknas — kontrollera .env-filen]", self._session_id)
+            return
+
+        prompt = self._build_commentary_prompt(player, index, event)
+        sid    = self._session_id
+        threading.Thread(
+            target=self._fetch_commentary,
+            args=(character, prompt, sid),
+            daemon=True,
+        ).start()
+
+    def _fetch_commentary(self, character: str, prompt: str, sid: int) -> None:
+        try:
+            client   = anthropic.Anthropic(api_key=self._api_key)
+            response = client.messages.create(
+                model=COMMENTATOR_MODEL,
+                max_tokens=120,
+                system=CHARACTER_PROMPTS[character],
+                messages=[{"role": "user", "content": prompt}],
+            )
+            text = response.content[0].text.strip()
+        except Exception as exc:
+            text = f"[Fel: {exc}]"
+        self.root.after(0, self._display_commentary, character, text, sid)
+
+    def _display_commentary(self, character: str, text: str, sid: int) -> None:
+        if sid != self._session_id:
+            return  # stale response from a previous game — discard
+
+        self.commentary_pending = False
+
+        self.chat_box.configure(state="normal")
+        self.chat_box.insert("end", f"{character}: ", "name")
+        self.chat_box.insert("end", f"{text}\n\n")
+        self.chat_box.see("end")
+        self.chat_box.configure(state="disabled")
+
+        self._continue_after_commentary()
+
+    def _continue_after_commentary(self) -> None:
+        if self.game_over:
+            return
+        if self._pending_ai_move:
+            self._pending_ai_move = False
+            self.current_player   = self.AI
+            self.ai_thinking      = True
+            self._update_status()
+            self._ai_after_id = self.root.after(self.AI_DELAY, self._do_ai_move)
+        else:
+            self.current_player = self.HUMAN
+            self._update_status()
 
 
 if __name__ == "__main__":
