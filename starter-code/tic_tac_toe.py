@@ -1,62 +1,99 @@
 """
-3-i-rad — GUI-version med tkinter
+3-i-rad — tkinter MVC-version
 
-Två spelare turas om att placera X och O på ett 3x3-bräde.
-Spelet avslutas när någon får tre i rad eller brädet är fullt.
+Model:      GameModel  — spelstatus och domänlogik, ingen UI-kod
+View:       GameView   — tkinter-widgets, render(model) synkar UI mot modellen
+Controller: GameController — tar emot händelser från vyn, uppdaterar modellen,
+                             anropar render
 
 Kör med: python tic_tac_toe.py
 """
 
 import tkinter as tk
+from dataclasses import dataclass, field
 
 EMPTY = " "
 
 WINNING_LINES: list[tuple[int, int, int]] = [
-    (0, 1, 2), (3, 4, 5), (6, 7, 8),  # rader
-    (0, 3, 6), (1, 4, 7), (2, 5, 8),  # kolumner
-    (0, 4, 8), (2, 4, 6),             # diagonaler
+    (0, 1, 2), (3, 4, 5), (6, 7, 8),
+    (0, 3, 6), (1, 4, 7), (2, 5, 8),
+    (0, 4, 8), (2, 4, 6),
 ]
 
-COLOR_BG = "#F5F5F0"
-COLOR_CELL = "#FFFFFF"
+COLOR_BG        = "#F5F5F0"
+COLOR_CELL      = "#FFFFFF"
 COLOR_CELL_HOVER = "#EAEAEA"
-COLOR_X = "#C0392B"
-COLOR_O = "#2980B9"
-COLOR_WIN = "#F9E79F"
-COLOR_BUTTON = "#2C3E50"
-COLOR_BUTTON_TEXT = "#000000"
+COLOR_X         = "#C0392B"
+COLOR_O         = "#2980B9"
+COLOR_WIN       = "#F9E79F"
+COLOR_BUTTON    = "#2C3E50"
+COLOR_SUBTEXT   = "#555555"
 
 
-def create_board() -> list[str]:
-    return [EMPTY] * 9
+# ---------------------------------------------------------------------------
+# Model
+# ---------------------------------------------------------------------------
+
+@dataclass
+class GameModel:
+    board: list[str]              = field(default_factory=lambda: [EMPTY] * 9)
+    current_player: str           = "X"
+    game_over: bool               = False
+    winner: str | None            = None
+    winning_line: tuple | None    = None
+
+    def reset(self) -> None:
+        self.board          = [EMPTY] * 9
+        self.current_player = "X"
+        self.game_over      = False
+        self.winner         = None
+        self.winning_line   = None
+
+    def is_valid_move(self, index: int) -> bool:
+        return not self.game_over and self.board[index] == EMPTY
+
+    def make_move(self, index: int) -> bool:
+        """Places the current player's mark. Returns True if the move changed state."""
+        if not self.is_valid_move(index):
+            return False
+
+        self.board[index] = self.current_player
+
+        winner, line = self._check_winner()
+        if winner:
+            self.winner       = winner
+            self.winning_line = line
+            self.game_over    = True
+        elif EMPTY not in self.board:
+            self.game_over = True
+        else:
+            self.current_player = "O" if self.current_player == "X" else "X"
+
+        return True
+
+    def _check_winner(self) -> tuple[str, tuple] | tuple[None, None]:
+        for line in WINNING_LINES:
+            a, b, c = line
+            if self.board[a] != EMPTY and self.board[a] == self.board[b] == self.board[c]:
+                return self.board[a], line
+        return None, None
 
 
-def check_winner(board: list[str]) -> tuple[str, tuple[int, int, int]] | tuple[None, None]:
-    for line in WINNING_LINES:
-        a, b, c = line
-        if board[a] != EMPTY and board[a] == board[b] == board[c]:
-            return board[a], line
-    return None, None
+# ---------------------------------------------------------------------------
+# View
+# ---------------------------------------------------------------------------
 
-
-def is_board_full(board: list[str]) -> bool:
-    return EMPTY not in board
-
-
-class TreIRad:
-    def __init__(self, root: tk.Tk) -> None:
-        self.root = root
-        self.root.title("3-i-rad")
-        self.root.resizable(False, False)
-        self.root.configure(bg=COLOR_BG)
-
-        self.board: list[str] = []
-        self.current_player: str = "X"
-        self.game_over: bool = False
+class GameView:
+    def __init__(self, root: tk.Tk, controller: "GameController") -> None:
+        self.root       = root
+        self.controller = controller
         self.cells: list[tk.Label] = []
 
+        root.title("3-i-rad")
+        root.resizable(False, False)
+        root.configure(bg=COLOR_BG)
+
         self._build_ui()
-        self._new_game()
 
     def _build_ui(self) -> None:
         self.status_label = tk.Label(
@@ -81,73 +118,90 @@ class TreIRad:
                 cursor="hand2",
             )
             cell.grid(row=i // 3 + 1, column=i % 3, padx=4, pady=4)
-            cell.bind("<Button-1>", lambda e, idx=i: self._on_cell_click(idx))
-            cell.bind("<Enter>", lambda e, idx=i: self._on_hover(idx, True))
-            cell.bind("<Leave>", lambda e, idx=i: self._on_hover(idx, False))
+            cell.bind("<Button-1>", lambda e, idx=i: self.controller.on_cell_click(idx))
+            cell.bind("<Enter>",    lambda e, idx=i: self.controller.on_hover(idx, entering=True))
+            cell.bind("<Leave>",    lambda e, idx=i: self.controller.on_hover(idx, entering=False))
             self.cells.append(cell)
 
-        self.restart_btn = tk.Button(
+        tk.Button(
             self.root,
             text="Nytt spel",
             font=("Helvetica", 13),
             bg=COLOR_BUTTON,
-            fg=COLOR_BUTTON_TEXT,
+            fg="#000000",
             activebackground="#3D5166",
-            activeforeground=COLOR_BUTTON_TEXT,
+            activeforeground="#000000",
             relief="flat",
             padx=16,
             pady=8,
             cursor="hand2",
-            command=self._new_game,
-        )
-        self.restart_btn.grid(row=4, column=0, columnspan=3, pady=12)
+            command=self.controller.on_new_game,
+        ).grid(row=4, column=0, columnspan=3, pady=12)
 
-    def _new_game(self) -> None:
-        self.board = create_board()
-        self.current_player = "X"
-        self.game_over = False
-        for cell in self.cells:
-            cell.config(text="", bg=COLOR_CELL, fg="black", cursor="hand2")
-        self._update_status()
+    def render(self, model: GameModel) -> None:
+        """Syncs all UI elements to the current model state."""
+        self._render_cells(model)
+        self._render_status(model)
 
-    def _update_status(self) -> None:
-        color = COLOR_X if self.current_player == "X" else COLOR_O
-        self.status_label.config(
-            text=f"Spelare {self.current_player}:s tur",
-            fg=color,
-        )
+    def _render_cells(self, model: GameModel) -> None:
+        for i, mark in enumerate(model.board):
+            cell = self.cells[i]
+            if mark == EMPTY:
+                cell.config(text="", bg=COLOR_CELL, fg="black", cursor="hand2")
+            else:
+                color = COLOR_X if mark == "X" else COLOR_O
+                cell.config(text=mark, fg=color, cursor="arrow")
 
-    def _on_hover(self, index: int, entering: bool) -> None:
-        if self.game_over or self.board[index] != EMPTY:
+        if model.winning_line:
+            for i in model.winning_line:
+                self.cells[i].config(bg=COLOR_WIN)
+
+    def _render_status(self, model: GameModel) -> None:
+        if model.winner:
+            color = COLOR_X if model.winner == "X" else COLOR_O
+            text  = f"Spelare {model.winner} vinner! 🎉"
+        elif model.game_over:
+            color, text = COLOR_SUBTEXT, "Oavgjort!"
+        else:
+            color = COLOR_X if model.current_player == "X" else COLOR_O
+            text  = f"Spelare {model.current_player}:s tur"
+
+        self.status_label.config(text=text, fg=color)
+
+    def update_hover(self, index: int, entering: bool, model: GameModel) -> None:
+        """Visual-only hover highlight — no state change, reads model to decide."""
+        if model.game_over or model.board[index] != EMPTY:
             return
         self.cells[index].config(bg=COLOR_CELL_HOVER if entering else COLOR_CELL)
 
-    def _on_cell_click(self, index: int) -> None:
-        if self.game_over or self.board[index] != EMPTY:
-            return
 
-        self.board[index] = self.current_player
-        color = COLOR_X if self.current_player == "X" else COLOR_O
-        self.cells[index].config(text=self.current_player, fg=color, cursor="arrow")
+# ---------------------------------------------------------------------------
+# Controller
+# ---------------------------------------------------------------------------
 
-        winner, winning_line = check_winner(self.board)
-        if winner is not None:
-            for i in winning_line:
-                self.cells[i].config(bg=COLOR_WIN)
-            self.status_label.config(text=f"Spelare {winner} vinner! 🎉", fg=color)
-            self.game_over = True
-            return
+class GameController:
+    def __init__(self, root: tk.Tk) -> None:
+        self.model = GameModel()
+        self.view  = GameView(root, self)
+        self.view.render(self.model)
 
-        if is_board_full(self.board):
-            self.status_label.config(text="Oavgjort!", fg="#555555")
-            self.game_over = True
-            return
+    def on_cell_click(self, index: int) -> None:
+        if self.model.make_move(index):
+            self.view.render(self.model)
 
-        self.current_player = "O" if self.current_player == "X" else "X"
-        self._update_status()
+    def on_hover(self, index: int, entering: bool) -> None:
+        self.view.update_hover(index, entering, self.model)
 
+    def on_new_game(self) -> None:
+        self.model.reset()
+        self.view.render(self.model)
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     root = tk.Tk()
-    TreIRad(root)
+    GameController(root)
     root.mainloop()
